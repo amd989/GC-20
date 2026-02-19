@@ -6,11 +6,11 @@
 */
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
-#include <EthernetClient.h>
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
 #include <WifiManager.h>
 #include <EEPROM.h>
+#include <PubSubClient.h>
 #include "SPI.h"
 #include "Adafruit_GFX.h"
 #include <Fonts/FreeSans9pt7b.h>
@@ -39,20 +39,26 @@ XPT2046_Touchscreen ts(CS_PIN);
 #define WHITE 0xFFFF
 #define DOSEBACKGROUND 0x0455
 
-// WiFi variables
+// WiFi and MQTT variables
 unsigned long currentUploadTime;
 unsigned long previousUploadTime;
 int passwordLength;
 int SSIDLength;
-int channelIDLength;
-int writeAPILength;
+int mqttBrokerLength;
+int mqttPortLength;
+int mqttUserLength;
+int mqttPassLength;
+int mqttTopicLength;
 char ssid[20];
 char password[20];
-char channelID[20]; // = "864288";
-char channelAPIkey[20]; // = "37SAHQPEQ7FOBC20";
-char server[] = "api.thingspeak.com";
+char mqttBroker[40];
+char mqttPort[6] = "1883";
+char mqttUser[20];
+char mqttPass[20];
+char mqttTopic[40] = "homeassistant/sensor/gc20";
 int attempts; // number of connection attempts when device starts up in monitoring mode
-WiFiClient client;
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
 
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC);
 
@@ -107,13 +113,16 @@ const int saveDeviceMode = 3;
 const int saveLoggingMode = 4;
 const int saveSSIDLen = 5;
 const int savePWLen = 6;
-const int saveIDLen = 7;
-const int saveAPILen = 8;
+const int saveMqttBrokerLen = 7;
+const int saveMqttPortLen = 8;
+const int saveMqttUserLen = 9;
+const int saveMqttPassLen = 10;
+const int saveMqttTopicLen = 11;
 
 // Data Logging variables
-int addr = 200;                 // starting address for data logging
-char jsonBuffer[14000] = "["; 
-char data[14500] = "{\"write_api_key\":\"";
+int addr = 300;                 // starting address for data logging (moved to 300 to make room for MQTT settings)
+char jsonBuffer[14000] = "[";
+char data[14500];
 unsigned long currentLogTime;
 unsigned long previousLogTime;
 
@@ -134,7 +143,7 @@ bool isLogging;
 bool deviceMode;
 
 // interrupt routine declaration
-void ICACHE_RAM_ATTR isr();
+void IRAM_ATTR isr();
 
 unsigned int previousIntMicros;              // timers to limit count increment rate in the ISR
 
@@ -298,7 +307,7 @@ void drawAlertPage();             // page 3
 void drawCalibrationPage();       // page 4
 void drawWifiPage();              // page 5
 void drawTimedCountPage();        // page 6
-void drawTimedCountRunningPage(int duration, int size); // page 7 
+void drawTimedCountRunningPage(int duration, int size); // page 7
 void drawDeviceModePage();        // page 8
 
 void drawFrame();
@@ -311,6 +320,10 @@ long EEPROMReadlong(long address);
 void EEPROMWritelong(int address, long value); // logging functions
 void createJsonFile();
 void clearLogs();
+
+// MQTT functions
+void reconnectMQTT();
+void publishMQTT(float cpm, float doseRate, float totalDose);
 
 void setup()
 {
@@ -335,35 +348,61 @@ void setup()
   deviceMode = EEPROM.read(saveDeviceMode);
   isLogging = EEPROM.read(saveLoggingMode);
   addr = EEPROMReadlong(96);
+  if (addr < 300 || addr > 4000) {   // guard against old firmware layout or corrupt value
+    addr = 300;
+    EEPROMWritelong(96, addr);
+    EEPROM.commit();
+  }
 
   SSIDLength = EEPROM.read(saveSSIDLen);
   passwordLength = EEPROM.read(savePWLen);
-  channelIDLength = EEPROM.read(saveIDLen);
-  writeAPILength = EEPROM.read(saveAPILen);
+  mqttBrokerLength = EEPROM.read(saveMqttBrokerLen);
+  mqttPortLength = EEPROM.read(saveMqttPortLen);
+  mqttUserLength = EEPROM.read(saveMqttUserLen);
+  mqttPassLength = EEPROM.read(saveMqttPassLen);
+  mqttTopicLength = EEPROM.read(saveMqttTopicLen);
 
-  for (int i = 10; i < 10 + SSIDLength; i++)
+  for (int i = 20; i < 20 + SSIDLength; i++)
   {
-    ssid[i - 10] = EEPROM.read(i);
+    ssid[i - 20] = EEPROM.read(i);
   }
   Serial.println(ssid);
 
-  for (int j = 30; j < 30 + passwordLength; j++)
+  for (int j = 50; j < 50 + passwordLength; j++)
   {
-    password[j - 30] = EEPROM.read(j);
+    password[j - 50] = EEPROM.read(j);
   }
   Serial.println(password);
 
-  for (int k = 50; k < 50 + channelIDLength; k++)
+  for (int k = 80; k < 80 + mqttBrokerLength; k++)
   {
-    channelID[k - 50] = EEPROM.read(k);
+    mqttBroker[k - 80] = EEPROM.read(k);
   }
-  Serial.println(channelID);
+  Serial.println(mqttBroker);
 
-  for (int l = 70; l < 70 + writeAPILength; l++)
+  for (int l = 130; l < 130 + mqttPortLength; l++)
   {
-    channelAPIkey[l - 70] = EEPROM.read(l);
+    mqttPort[l - 130] = EEPROM.read(l);
   }
-  Serial.println(channelAPIkey);
+  Serial.println(mqttPort);
+
+  for (int m = 140; m < 140 + mqttUserLength; m++)
+  {
+    mqttUser[m - 140] = EEPROM.read(m);
+  }
+  Serial.println(mqttUser);
+
+  for (int n = 170; n < 170 + mqttPassLength; n++)
+  {
+    mqttPass[n - 170] = EEPROM.read(n);
+  }
+  Serial.println(mqttPass);
+
+  for (int o = 200; o < 200 + mqttTopicLength; o++)
+  {
+    mqttTopic[o - 200] = EEPROM.read(o);
+  }
+  Serial.println(mqttTopic);
 
   attachInterrupt(interruptPin, isr, FALLING);
 
@@ -404,6 +443,12 @@ void setup()
       tft.setCursor(68, 200);
       tft.println("Connected!");
       delay(1000);
+
+      // Setup MQTT
+      int port = atoi(mqttPort);
+      if (port == 0) port = 1883;  // Default port if not set
+      mqttClient.setServer(mqttBroker, port);
+      reconnectMQTT();
     }
     drawHomePage();
   }
@@ -733,33 +778,14 @@ void loop()
         }
       }
     }
-    if (deviceMode)    // deviceMode is 1 when in monitoring station mode. Uploads CPM to thingspeak every 5 minutes
+    if (deviceMode)    // deviceMode is 1 when in monitoring station mode. Publishes data via MQTT every 5 minutes
     {
       currentUploadTime = millis();
-      if ((currentUploadTime - previousUploadTime) > 300000)
+      if ((currentUploadTime - previousUploadTime) > 60000)
       {
         previousUploadTime = currentUploadTime;
-        if (client.connect(server, 80))
-        {
-          String postStr = channelAPIkey;
-          postStr += "&field2=";
-          postStr += String(averageCount);
-          postStr += "\r\n\r\n";
-          char temp[50] = "X-THINGSPEAKAPIKEY:";
-          strcat(temp, channelAPIkey);
-          strcat(temp, "\n");
-          client.print("POST /update HTTP/1.1\n");
-          client.print("Host: api.thingspeak.com\n");
-          client.print("Connection: close\n");
-          client.print(temp);
-          client.print("Content-Type: application/x-www-form-urlencoded\n");
-          client.print("Content-Length: ");
-          client.print(postStr.length());
-          client.print("\n\n");
-          client.print(postStr);
-          Serial.println(postStr);
-        }
-        client.stop();
+        mqttClient.loop();  // Maintain MQTT connection
+        publishMQTT(averageCount, doseRate, totalDose);
       }
     }
   }
@@ -985,87 +1011,119 @@ void loop()
         tft.setCursor(20, 140);
         tft.println("browse to 192.168.4.1");
         tft.setCursor(20, 160);
-        tft.println("Enter credentials");
+        tft.println("Enter WiFi credentials");
         tft.setCursor(20, 180);
-        tft.println("of your WiFi network");
+        tft.println("and MQTT broker info:");
         tft.setCursor(20, 200);
-        tft.println("and the Channel ID and");
+        tft.println("Broker, Port, User,");
         tft.setCursor(20, 220);
-        tft.println("write API key of your");
+        tft.println("Password, and Topic");
         tft.setCursor(20, 240);
-        tft.println("ThingSpeak channel");
+        tft.println("for publishing data");
 
         delay(100);
         WiFiManager wifiManager;
 
-        char channelIDSt[20];
-        char writeAPISt[20];
+        // Pre-populate with current saved values so the form shows them
+        char mqttBrokerSt[40] = {};
+        char mqttPortSt[6] = {};
+        char mqttUserSt[20] = {};
+        char mqttPassSt[20] = {};
+        char mqttTopicSt[40] = {};
+        strncpy(mqttBrokerSt, mqttBroker, sizeof(mqttBrokerSt) - 1);
+        strncpy(mqttPortSt,   mqttPort,   sizeof(mqttPortSt)   - 1);
+        strncpy(mqttUserSt,   mqttUser,   sizeof(mqttUserSt)   - 1);
+        strncpy(mqttPassSt,   mqttPass,   sizeof(mqttPassSt)   - 1);
+        strncpy(mqttTopicSt,  mqttTopic,  sizeof(mqttTopicSt)  - 1);
 
-        WiFiManagerParameter channel_id("0", "Channel ID", channelIDSt, 20); // create custom parameters for setup
-        
-        WiFiManagerParameter write_api("1", "Write API", writeAPISt, 20);
-        wifiManager.addParameter(&channel_id);
-        wifiManager.addParameter(&write_api);
+        WiFiManagerParameter mqtt_broker("0", "MQTT Broker", mqttBrokerSt, 40);
+        WiFiManagerParameter mqtt_port("1", "MQTT Port", mqttPortSt, 6);
+        WiFiManagerParameter mqtt_user("2", "MQTT User", mqttUserSt, 20);
+        WiFiManagerParameter mqtt_pass("3", "MQTT Password", mqttPassSt, 20);
+        WiFiManagerParameter mqtt_topic("4", "MQTT Topic", mqttTopicSt, 40);
 
-        wifiManager.startConfigPortal("GC20");            // put the esp in AP mode for wifi setup, create a network with name "GC20"
+        wifiManager.addParameter(&mqtt_broker);
+        wifiManager.addParameter(&mqtt_port);
+        wifiManager.addParameter(&mqtt_user);
+        wifiManager.addParameter(&mqtt_pass);
+        wifiManager.addParameter(&mqtt_topic);
 
-        strcpy(channelIDSt, channel_id.getValue());
-        strcpy(writeAPISt, write_api.getValue());
+        wifiManager.setBreakAfterConfig(true);  // return from startConfigPortal even if WiFi not configured
+        wifiManager.startConfigPortal("GC20");
 
-        size_t idLen = String(channelIDSt).length();
+        strcpy(mqttBrokerSt, mqtt_broker.getValue());
+        strcpy(mqttPortSt, mqtt_port.getValue());
+        strcpy(mqttUserSt, mqtt_user.getValue());
+        strcpy(mqttPassSt, mqtt_pass.getValue());
+        strcpy(mqttTopicSt, mqtt_topic.getValue());
 
-        size_t apiLen = String(writeAPISt).length();
+        size_t brokerLen = String(mqttBrokerSt).length();
+        size_t portLen = String(mqttPortSt).length();
+        size_t userLen = String(mqttUserSt).length();
+        size_t passLen_mqtt = String(mqttPassSt).length();
+        size_t topicLen = String(mqttTopicSt).length();
 
-        char channelInit = EEPROM.read(4001);  // first character of channelID is stored in EEPROM address 4001
-        char apiKeyInit = EEPROM.read(4002);   // Only overwrite channelIDSt and writeAPISt if new value of the first character is different from what was saved.
-
-        if (channelInit != channelIDSt[0])   
+        for (unsigned int a = 80; a < 80 + brokerLen; a++)
         {
-          for (unsigned int a = 50; a < 50 + idLen; a++)
-          {
-            EEPROM.write((a), channelIDSt[a - 50]);
-          }
-          EEPROM.write(saveIDLen, idLen);
+          EEPROM.write((a), mqttBrokerSt[a - 80]);
         }
+        EEPROM.write(saveMqttBrokerLen, brokerLen);
 
-        if(apiKeyInit != writeAPISt[0])
+        for (unsigned int b = 130; b < 130 + portLen; b++)
         {
-          for (unsigned int b = 70; b < 70 + apiLen; b++)
-          {
-            EEPROM.write((b), writeAPISt[b - 70]);
-          }
-          EEPROM.write(saveAPILen, apiLen);
+          EEPROM.write((b), mqttPortSt[b - 130]);
         }
+        EEPROM.write(saveMqttPortLen, portLen);
 
-        String ssidString = WiFi.SSID();      // retrieve ssid and password form the WifiManager library
+        for (unsigned int c = 140; c < 140 + userLen; c++)
+        {
+          EEPROM.write((c), mqttUserSt[c - 140]);
+        }
+        EEPROM.write(saveMqttUserLen, userLen);
+
+        for (unsigned int d = 170; d < 170 + passLen_mqtt; d++)
+        {
+          EEPROM.write((d), mqttPassSt[d - 170]);
+        }
+        EEPROM.write(saveMqttPassLen, passLen_mqtt);
+
+        for (unsigned int e = 200; e < 200 + topicLen; e++)
+        {
+          EEPROM.write((e), mqttTopicSt[e - 200]);
+        }
+        EEPROM.write(saveMqttTopicLen, topicLen);
+
+        // Update in-memory globals so current session uses new values
+        strcpy(mqttBroker, mqttBrokerSt);
+        strcpy(mqttPort, mqttPortSt);
+        strcpy(mqttUser, mqttUserSt);
+        strcpy(mqttPass, mqttPassSt);
+        strcpy(mqttTopic, mqttTopicSt);
+
+        // Only overwrite WiFi credentials if a new SSID was actually submitted
+        String ssidString = WiFi.SSID();
         String passwordString = WiFi.psk();
-
         size_t ssidLen = ssidString.length();
         size_t passLen = passwordString.length();
-
         Serial.println(ssidLen);
         Serial.println(passLen);
-
-        char ssidChar[20];
-        char passwordChar[20];
-
-        ssidString.toCharArray(ssidChar, ssidLen + 1); 
-        passwordString.toCharArray(passwordChar, passLen + 1);
-
-        for (unsigned int a = 10; a < 10 + ssidLen; a++)
+        if (ssidLen > 0)
         {
-          EEPROM.write((a), ssidChar[a - 10]);             // save ssid and ssid length to EEPROM
+          char ssidChar[20];
+          char passwordChar[20];
+          ssidString.toCharArray(ssidChar, ssidLen + 1);
+          passwordString.toCharArray(passwordChar, passLen + 1);
+          for (unsigned int a = 20; a < 20 + ssidLen; a++)
+          {
+            EEPROM.write((a), ssidChar[a - 20]);
+          }
+          EEPROM.write(saveSSIDLen, ssidLen);
+          for (unsigned int b = 50; b < 50 + passLen; b++)
+          {
+            EEPROM.write((b), passwordChar[b - 50]);
+          }
+          EEPROM.write(savePWLen, passLen);
         }
-        EEPROM.write(saveSSIDLen, ssidLen);
-        
-        for (unsigned int b = 30; b < 30 + passLen; b++)
-        {    
-          EEPROM.write((b), passwordChar[b - 30]);          // save password and password length to EEPROM
-        }
-        EEPROM.write(savePWLen, passLen);
-
-        EEPROM.write(4001, channelIDSt[0]);                 // save first characters of channel ID and api key to EEPROM
-        EEPROM.write(4002, writeAPISt[0]);
 
         EEPROM.commit();
 
@@ -1093,62 +1151,53 @@ void loop()
         }
 
         tft.setCursor(36, 160);
-        tft.println("Creating JSON file..");
-        createJsonFile();                         // reads logged data from EEPROM and creates a json file
-        Serial.println(jsonBuffer);
-        delay(1000);
-        tft.setCursor(70, 220);
-        tft.println("Uploading..");
+        tft.println("Uploading logged data");
+        tft.setCursor(70, 200);
+        tft.println("via MQTT..");
         delay(1000);
 
-        char secondHalf[50] = "\",\"updates\":";      
-        strcat(data, channelAPIkey);
-        strcat(data, secondHalf);               
+        // Setup MQTT
+        int port = atoi(mqttPort);
+        if (port == 0) port = 1883;
+        mqttClient.setServer(mqttBroker, port);
+        reconnectMQTT();
 
-        strcat(data,jsonBuffer);                // concatenate strings together and store in array named data
-        strcat(data,"}");
+        // Publish logged data points to MQTT
+        int dataPoints = (addr - 100) / 4;
+        tft.setCursor(36, 240);
+        tft.print("Uploading ");
+        tft.print(dataPoints);
+        tft.println(" points..");
 
-        Serial.println(data);
-
-        client.stop();
-        String data_length = String(strlen(data)+1);   
-        
-        if (client.connect(server, 80)) {          // post data to thingspeak
-          char temp1[100] = "POST /channels/";
-          char temp2[30] = "/bulk_update.json HTTP/1.1";
-          
-          strcat(temp1, channelID);
-          strcat(temp1, temp2);
-
-          client.println(temp1); 
-          client.println("Host: api.thingspeak.com");
-          client.println("User-Agent: mw.doc.bulk-update (Arduino ESP8266)");
-          client.println("Connection: close");
-          client.println("Content-Type: application/json");
-          client.println("Content-Length: "+data_length);
-          client.println();
-          client.println(data);
-          client.stop();
-          
-          WiFi.disconnect();
-          WiFi.mode( WIFI_OFF );                // turn off wifi
-          WiFi.forceSleepBegin();
-          delay(1);
-
-          clearLogs();                 // erase logs and re-initialize the json buffer
-          tft.setCursor(43, 260);
-          tft.println("Resetting Device..");
-          delay(1000);
-          ESP.reset();                 
-        }
-        else 
+        for (int i = 100; i < addr; i += 4)
         {
-          tft.setCursor(50, 260);
-          tft.println("Failed to upload");
-          delay(1000);
-          ESP.reset();
+          int count = EEPROMReadlong(i);
+          float rate = (float)count / conversionFactor;
+
+          String payload = "{";
+          payload += "\"cpm\":";
+          payload += String(count);
+          payload += ",\"dose_rate\":";
+          payload += String(rate, 3);
+          payload += ",\"dose_rate_unit\":\"";
+          payload += (doseUnits == 0) ? "uSv/h" : "mR/h";
+          payload += "\",\"logged\":true";
+          payload += "}";
+
+          mqttClient.publish(mqttTopic, payload.c_str());
+          delay(100);  // Small delay between messages
         }
-        
+
+        WiFi.disconnect();
+        WiFi.mode( WIFI_OFF );
+        WiFi.forceSleepBegin();
+        delay(1);
+
+        clearLogs();
+        tft.setCursor(43, 260);
+        tft.println("Resetting Device..");
+        delay(1000);
+        ESP.reset();
       }
       else if ((x > 3 && x < 237) && (y > 114 && y < 158)) // logging 
       {
@@ -1805,7 +1854,7 @@ void drawDeviceModePage()
   tft.println("to take effect");
 }
 
-void isr() // interrupt service routine
+void IRAM_ATTR isr() // interrupt service routine
 {
   if ((micros() - 200) > previousIntMicros){
     currentCount++;
@@ -1913,7 +1962,7 @@ void EEPROMWritelong(int address, long value) {
 void createJsonFile()
 {
   Serial.println(addr);
-  for (int i = 100; i < addr; i += 4)
+  for (int i = 300; i < addr; i += 4)
   {
     int count = EEPROMReadlong(i);
 
@@ -1950,7 +1999,7 @@ void drawBlankDialogueBox()
 
 void clearLogs()
 {
-  for (int j = 100; j < 4000; j ++)
+  for (int j = 300; j < 4000; j ++)
   {
     EEPROMWritelong(j, 0);
   }
@@ -1958,9 +2007,62 @@ void clearLogs()
   {
     jsonBuffer[k] = 0;
   }
-  addr = 100;
+  addr = 300;
   EEPROMWritelong(96, addr);
   EEPROM.write(saveLoggingMode, 0);
   EEPROM.commit();
   isLogging = 0;
+}
+
+// MQTT connection function
+void reconnectMQTT() {
+  if (!mqttClient.connected()) {
+    Serial.print("Attempting MQTT connection...");
+
+    // Create a client ID
+    String clientId = "GC20-";
+    clientId += String(ESP.getChipId());
+
+    // Attempt to connect
+    bool connected = false;
+    if (strlen(mqttUser) > 0) {
+      connected = mqttClient.connect(clientId.c_str(), mqttUser, mqttPass);
+    } else {
+      connected = mqttClient.connect(clientId.c_str());
+    }
+
+    if (connected) {
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.println(mqttClient.state());
+    }
+  }
+}
+
+// Publish radiation data to MQTT
+void publishMQTT(float cpm, float doseRate, float totalDose) {
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+
+  if (mqttClient.connected()) {
+    // Create JSON payload compatible with Home Assistant
+    String payload = "{";
+    payload += "\"cpm\":";
+    payload += String(cpm, 2);
+    payload += ",\"dose_rate\":";
+    payload += String(doseRate, 3);
+    payload += ",\"dose_rate_unit\":\"";
+    payload += (doseUnits == 0) ? "uSv/h" : "mR/h";
+    payload += "\",\"total_dose\":";
+    payload += String(totalDose, 4);
+    payload += ",\"total_dose_unit\":\"";
+    payload += (doseUnits == 0) ? "uSv" : "mR";
+    payload += "\"}";
+
+    mqttClient.publish(mqttTopic, payload.c_str());
+    Serial.print("Published to MQTT: ");
+    Serial.println(payload);
+  }
 }
