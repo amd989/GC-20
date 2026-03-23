@@ -11,7 +11,8 @@
 - Audible clicker and LED indicator toggled on and off from homescreen
 - Offline data logging
 - Post bulk logged data to cloud service (ThingSpeak) to graph, analyze and/or save to computer
-- Monitoring Station mode: device stays connected to WiFi and regularly posts ambient radiation level to ThingSpeak channel
+- MQTT publishing for integration with Home Assistant and other home automation systems
+- Monitoring Station mode: device stays connected to WiFi and publishes ambient radiation data via MQTT every 30 seconds
 
 ### Overview and User's Guide
 
@@ -49,14 +50,51 @@ Finally, tapping the Logging and WiFi button offers a further sub-menu of option
 
 ![test](https://raw.githubusercontent.com/pra22/GC-20/master/Images/wifi_setup.jpg)
 
-To set up WiFi, tap on WiFi setup and the GC-20 will enter AP mode. Using any wifi connected device with a web browser, like a phone or a laptop, search local networks and connect to the open network named "GC20". The browser will either automatically take you to the setup page, or if doesn't, enter the url 192.168.4.1. Select your network name from the scanned list, enter the password, and also enter the credentials of your ThingSpeak channel, i.e. the channel ID and the write API. Once that's done, hit save and the GC-20 will save the settings to permanent memory and reset itself. You can always change the wifi or channel details at any time by repeating the above.
+To set up WiFi and MQTT, tap on WiFi setup and the GC-20 will enter AP mode. Using any WiFi-connected device with a web browser, like a phone or a laptop, search local networks and connect to the open network named "GC20". The browser will either automatically take you to the setup page, or if it doesn't, enter the url 192.168.4.1. Select your network name from the scanned list, enter the password, and configure your MQTT broker settings (broker IP/hostname, port, username, password, and topic). Hit save and the GC-20 will save the settings to permanent memory and reset itself. You can update WiFi or MQTT settings at any time by repeating the above. To update only MQTT settings without changing WiFi, simply submit the form without selecting a WiFi network.
 
 ![test](https://raw.githubusercontent.com/pra22/GC-20/master/Images/device_mode.jpg)
 
-In the Device Mode menu option, the user can choose between the portable Geiger counter mode, or configure the device as a radiation monitoring station. In the monitoring station mode, the GC-20 is always connected to WiFi, and updates the ThingSpeak field every 5 minutes. If it can't connect to WiFi during startup, it waits for 30 seconds before starting in portable Geiger counter mode.
+In the Device Mode menu option, the user can choose between the portable Geiger counter mode, or configure the device as a radiation monitoring station. In the monitoring station mode, the GC-20 is always connected to WiFi and publishes radiation data to the configured MQTT broker every 30 seconds. If it can't connect to WiFi during startup, it waits for 30 seconds before starting in portable Geiger counter mode.
 
-![test](https://raw.githubusercontent.com/pra22/GC-20/master/Images/thingspeak_live.png)
-![test](https://raw.githubusercontent.com/pra22/GC-20/master/Images/thingspeak_log.png)
+### MQTT & Home Assistant Integration
 
-Examples of the ThingSpeak data plots from the radiation monitor and from a bulk-upload of logged data.
+The GC-20 publishes radiation data as JSON to an MQTT topic, making it easy to integrate with Home Assistant or any MQTT-compatible system. Each message contains:
+
+```json
+{
+  "cpm": 23.00,
+  "dose_rate": 0.131,
+  "dose_rate_unit": "uSv/h",
+  "total_dose": 0.0108,
+  "total_dose_unit": "uSv"
+}
+```
+
+To add the GC-20 as a sensor in Home Assistant, add the following to your `configuration.yaml`:
+
+```yaml
+mqtt:
+  sensor:
+    - name: "GC-20 CPM"
+      state_topic: "homeassistant/sensor/gc20"
+      value_template: "{{ value_json.cpm }}"
+      unit_of_measurement: "CPM"
+      icon: mdi:radioactive
+
+    - name: "GC-20 Dose Rate"
+      state_topic: "homeassistant/sensor/gc20"
+      value_template: "{{ value_json.dose_rate }}"
+      unit_of_measurement: "uSv/h"
+      icon: mdi:radiation
+
+    - name: "GC-20 Total Dose"
+      state_topic: "homeassistant/sensor/gc20"
+      value_template: "{{ value_json.total_dose }}"
+      unit_of_measurement: "uSv"
+      icon: mdi:counter
+```
+
+> **Note:** If the device is set to Rems mode, change the units to `mR/h` and `mR` respectively.
+
+Logged data can also be uploaded via MQTT. Each stored data point is published as an individual message with a `"logged": true` field to distinguish it from live readings.
 
